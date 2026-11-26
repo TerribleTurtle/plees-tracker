@@ -1,0 +1,151 @@
+name: Dev OTA
+
+# Synthesizes and publishes development OTA releases from the dev-ota branch.
+# The dev-ota branch reflects the local default branch tree on top of upstream,
+# with unmerged commit objects and upstream issue references scrubbed.
+
+on:
+  push:
+    branches:
+      - dev-ota
+  workflow_dispatch:
+
+concurrency:
+  group: dev-ota-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dev-ota:
+    name: Build Dev OTA & Publish Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: 21
+
+      - name: Compute OTA version and release notes
+        id: meta
+        run: |
+          COMMIT_MSG=$(git log -1 --format='%B' HEAD)
+          MAIN_SHA=$(echo "$COMMIT_MSG" | sed -n 's/.*\[\(main\|master\|trunk\|develop\):\([0-9a-f]*\)\].*/\2/p')
+          [ -z "$MAIN_SHA" ] && MAIN_SHA=$(git rev-parse --short=8 HEAD)
+
+          UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null || true)
+          if [ -z "$UPSTREAM_URL" ] && [ -f "KNOWN_ISSUES.json" ]; then
+            UPSTREAM_URL=$(jq -r '.meta.repo_url // empty' KNOWN_ISSUES.json 2>/dev/null || true)
+          fi
+
+          VERSION_NAME=""
+          if [ -n "$UPSTREAM_URL" ]; then
+            RAW_TAG=$(git ls-remote --tags --refs "$UPSTREAM_URL" 2>/dev/null | awk '{print $2}' | sed 's|^refs/tags/||' | grep -E '^[vV]?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9]+)?$' | sort -V | tail -n 1 || true)
+            if [ -n "$RAW_TAG" ]; then
+              VERSION_NAME=$(echo "$RAW_TAG" | sed -E 's/^[vV]?([0-9]+\.[0-9]+\.[0-9]+)(-[0-9]+)?$/\1/')
+            fi
+          fi
+
+          if [ -z "$VERSION_NAME" ]; then
+            if [ -f "app/build.gradle" ]; then
+              VERSION_NAME=$(sed -n 's/^[[:space:]]*versionName[[:space:]]*["'\'']\([0-9][^"'\'']*\)["'\'']/\1/p' app/build.gradle | head -n 1)
+            fi
+          fi
+          [ -z "$VERSION_NAME" ] && VERSION_NAME="0.0.0"
+
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          BUILD_NAME="${VERSION_NAME}-dev.${GITHUB_RUN_NUMBER}"
+          TAG="v${BUILD_NAME}"
+
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "build_number=${BUILD_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "build_name=${BUILD_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "main_sha=${MAIN_SHA}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Dev OTA (\`${TAG}\`)"
+            echo "- **Commit snapshot:** \`${MAIN_SHA}\`"
+            echo "- **Upstream semver:** \`${VERSION_NAME}\`"
+            echo ""
+            echo "$COMMIT_MSG" | tail -n +2
+          } > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Build Gradle APKs (foss and gplay)
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [ -x "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          fi
+          mkdir -p dist app/keystore
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > app/keystore/plees_keystore.jks
+            ./gradlew assembleFossRelease assembleGplayRelease
+            for apk in app/build/outputs/apk/*/release/app-*-release.apk; do
+              [ -e "$apk" ] && cp "$apk" dist/
+            done
+          else
+            ./gradlew assembleFossDebug assembleGplayDebug
+            for apk in app/build/outputs/apk/*/debug/app-*-debug.apk; do
+              [ -e "$apk" ] && cp "$apk" dist/
+            done
+          fi
+          ls -la dist/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          MAIN_SHA: ${{ steps.meta.outputs.main_sha }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+        run: |
+          if gh release view "$TAG" &>/dev/null; then
+            echo "Release $TAG already exists."
+          else
+            gh release create "$TAG" dist/*.apk \
+              --title "Dev OTA ${TAG} (${MAIN_SHA})" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --latest || true
+          fi
+
+          # Prune stale v*-dev.* GitHub releases (semver prefix != v${VERSION_NAME}-dev. or beyond 5 newest)
+          PREFIX="v${VERSION_NAME}-dev."
+          ALL_DEV_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null | grep -E '^v.*-dev\.[0-9]+$' || true)
+          KEPT_COUNT=0
+          for rtag in $ALL_DEV_RELEASES; do
+            case "$rtag" in
+              "$PREFIX"*)
+                KEPT_COUNT=$((KEPT_COUNT + 1))
+                if [ "$KEPT_COUNT" -gt 5 ]; then
+                  echo "Pruning excess dev OTA release (>5): $rtag"
+                  gh release delete "$rtag" --cleanup-tag --yes || true
+                fi
+                ;;
+              *)
+                echo "Pruning stale dev OTA release (semver mismatch != $PREFIX): $rtag"
+                gh release delete "$rtag" --cleanup-tag --yes || true
+                ;;
+            esac
+          done
+
+          # Prune orphaned remote refs/tags/v*-dev.* tags
+          SURVIVING_RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          REMOTE_DEV_TAGS=$(git ls-remote --tags --refs origin 'refs/tags/v*-dev.*' 2>/dev/null | awk '{print $2}' | sed 's|^refs/tags/||' || true)
+          for rtag in $REMOTE_DEV_TAGS; do
+            if ! echo "$SURVIVING_RELEASES" | grep -qx "$rtag"; then
+              echo "Pruning orphaned remote tag: $rtag"
+              git push origin --delete "refs/tags/$rtag" || true
+            fi
+          done
